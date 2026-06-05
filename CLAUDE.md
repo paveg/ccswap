@@ -3,7 +3,7 @@
 Account profile switcher for Claude Code: save the logged-in account under a
 name and switch between accounts/orgs. Rust CLI, distributed via npm.
 
-Full design and decisions: `docs/design.md`, `docs/adr/`.
+Full design and decisions: `docs/DESIGN.md`, `docs/adr/`.
 
 ## What a switch touches (and nothing else)
 
