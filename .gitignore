@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target
+
+# Agent worktrees (Agent tool `isolation: "worktree"`)
+/.claude/worktrees/
+
+# macOS
+.DS_Store
