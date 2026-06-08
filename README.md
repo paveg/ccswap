@@ -25,13 +25,19 @@ It does not modify Claude Code settings, projects, history, or other files under
 
 ## Install
 
-From this repository:
+Install directly from GitHub:
+
+```sh
+cargo install --git https://github.com/paveg/ccswap.git
+```
+
+Or, from a local checkout:
 
 ```sh
 cargo install --path .
 ```
 
-Or build a local binary:
+For development, you can also build a local binary without installing it:
 
 ```sh
 cargo build --release
