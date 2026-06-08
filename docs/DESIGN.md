@@ -15,6 +15,10 @@ ccswap use  <name>     Switch to <name> (`-` = previous account; --force skips a
 ccswap list            List saved profiles (current marked with *)
 ccswap current         Show the active account
 ccswap rm   <name>     Delete a profile
+ccswap hook add <name> <pre|post> -- <cmd> [args...]
+ccswap hook list [name]
+ccswap hook rm <name> <pre|post> <index>
+ccswap hook edit       Open the hook config with $VISUAL or $EDITOR
 ```
 
 Non-goals (v1): managing `~/.claude/` settings/projects/history, multi-machine
@@ -95,6 +99,7 @@ files. The npm install pulls a prebuilt binary as a platform package
 ## XDG layout (strict XDG, including macOS)
 
 ```
+$XDG_CONFIG_HOME/ccswap/hooks.json           # profile hook commands (no token)
 $XDG_DATA_HOME/ccswap/profiles/<name>.json   # account identity snapshot (no token)
 $XDG_STATE_HOME/ccswap/previous.json          # previous account (C); previous token (A) is in the vault under `__previous`
 ```
@@ -115,6 +120,73 @@ discovered default:
 - `CCSWAP_KEYCHAIN_ACCOUNT` — macOS Keychain account (default `$USER`).
 - `CCSWAP_CLAUDE_JSON` — path to `~/.claude.json`.
 - `CCSWAP_CREDENTIALS_PATH` — Linux active-credential file path.
+
+## Hooks
+
+Hooks are profile-scoped commands run around `ccswap use`. They are intended for
+local state that must follow the account profile, such as local files, shell
+state, or other tool configuration.
+
+Configuration lives at `$XDG_CONFIG_HOME/ccswap/hooks.json`, but users normally
+manage it with the CLI:
+
+```
+ccswap hook add work post -- apply-claude-profile work
+ccswap hook add private post -- apply-claude-profile private
+ccswap hook list
+ccswap hook rm work post 1
+ccswap hook edit
+```
+
+Config shape:
+
+```json
+{
+  "profiles": {
+    "work": {
+      "postUse": [
+        {
+          "command": "apply-claude-profile",
+          "args": ["work"]
+        }
+      ]
+    }
+  }
+}
+```
+
+Phases:
+
+- `preUse`: run after the target profile metadata and credential are loaded, but
+  before any account state is changed. Failure cancels the switch.
+- `postUse`: run after both `oauthAccount` and the active credential have been
+  written. Failure triggers account rollback.
+
+Rollback policy: when `postUse` or a later switch step fails after `preUse`
+succeeded, `ccswap` restores the previous `oauthAccount` and credential. If the
+previous account matches a saved profile, `ccswap` then runs that profile's
+`postUse` hooks with `CCSWAP_HOOK_ROLLBACK=1`. This lets the same per-profile
+hook command restore the previous profile's local state.
+
+Hook processes inherit stdout, stderr, and the normal environment. `ccswap` adds
+identity-only environment variables and never passes token bytes to hooks:
+
+```
+CCSWAP_HOOK_PHASE=pre-use|post-use
+CCSWAP_HOOK_ROLLBACK=0|1
+CCSWAP_TARGET_PROFILE
+CCSWAP_PREVIOUS_PROFILE
+CCSWAP_TARGET_ACCOUNT_UUID
+CCSWAP_TARGET_ORGANIZATION_UUID
+CCSWAP_TARGET_EMAIL
+CCSWAP_TARGET_ORGANIZATION_NAME
+CCSWAP_TARGET_DISPLAY_NAME
+CCSWAP_PREVIOUS_ACCOUNT_UUID
+CCSWAP_PREVIOUS_ORGANIZATION_UUID
+CCSWAP_PREVIOUS_EMAIL
+CCSWAP_PREVIOUS_ORGANIZATION_NAME
+CCSWAP_PREVIOUS_DISPLAY_NAME
+```
 
 ## Store abstraction (the core of cross-platform support)
 
@@ -142,13 +214,19 @@ flowchart TD
   S([use NAME]) --> W{Claude Code running?}
   W -->|yes| warn["warn (skip with --force)"]
   W -->|no| snap
-  warn --> snap["1. snapshot current A,C -> previous"]
-  snap --> load["2. load target token(B) + oauthAccount(meta)"]
-  load --> wc["3. write C: replace only oauthAccount<br/>in ~/.claude.json (temp -> fsync -> rename)"]
-  wc --> wa["4. write A: Keychain set / file 0600"]
-  wa --> done([print new current])
+  warn --> load["1. load target token(B) + oauthAccount(meta)"]
+  load --> pre["2. run target preUse hooks"]
+  pre --> snap["3. snapshot current A,C -> previous"]
+  snap --> wc["4. write C: replace only oauthAccount<br/>in ~/.claude.json (temp -> fsync -> rename)"]
+  wc --> wa["5. write A: Keychain set / file 0600"]
+  wa --> post["6. run target postUse hooks"]
+  post --> done([print new current])
+  pre -->|fail| errpre([report error; no switch])
   wc -->|fail| rb["rollback from previous"]
   wa -->|fail| rb
+  post -->|fail| rb
+  rb --> rbpost["previous profile postUse hooks<br/>CCSWAP_HOOK_ROLLBACK=1"]
+  rbpost --> err
   rb --> err([report error])
 ```
 
@@ -176,6 +254,7 @@ Added incrementally as each feature's failing test requires them.
 src/
   main.rs        clap CLI + dispatch
   paths.rs       XDG path resolution (etcetera Xdg strategy)
+  hooks.rs       hook config, management helpers, and hook runner
   claude.rs      ~/.claude.json oauthAccount read / surgical replace / atomic write
   active.rs      ActiveStore trait + macos/linux impls
   vault.rs       ProfileVault (keyring + file fallback)

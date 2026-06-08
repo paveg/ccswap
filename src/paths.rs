@@ -8,6 +8,7 @@ pub struct Paths {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub state_dir: PathBuf,
+    pub hooks_path: PathBuf,
     pub profiles_dir: PathBuf,
     pub file_vault_dir: PathBuf,
     pub previous_path: PathBuf,
@@ -68,6 +69,7 @@ impl Paths {
         let state_dir = state_dir.into();
 
         Self {
+            hooks_path: config_dir.join("hooks.json"),
             profiles_dir: data_dir.join("profiles"),
             file_vault_dir: data_dir.join("vault"),
             previous_path: state_dir.join("previous.json"),
@@ -104,9 +106,10 @@ mod tests {
         let unchanged = base.clone().apply_overrides(None, None);
         assert_eq!(unchanged, base);
 
-        let overridden = base
-            .clone()
-            .apply_overrides(Some("/custom/claude.json".into()), Some("/custom/creds".into()));
+        let overridden = base.clone().apply_overrides(
+            Some("/custom/claude.json".into()),
+            Some("/custom/creds".into()),
+        );
         assert_eq!(
             overridden.claude_json_path,
             Path::new("/custom/claude.json")
@@ -128,6 +131,7 @@ mod tests {
             Path::new("/home/me/.claude/.credentials.json")
         );
         assert_eq!(paths.profiles_dir, Path::new("/data/ccswap/profiles"));
+        assert_eq!(paths.hooks_path, Path::new("/cfg/ccswap/hooks.json"));
         assert_eq!(paths.file_vault_dir, Path::new("/data/ccswap/vault"));
         assert_eq!(
             paths.previous_path,

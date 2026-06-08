@@ -1,21 +1,23 @@
-use crate::active::{ActiveStore, SystemActiveStore, system_active_store};
+use crate::active::{system_active_store, ActiveStore, SystemActiveStore};
 use crate::claude::ClaudeFile;
 use crate::fsutil;
+use crate::hooks::{ConfiguredHooks, HookPhase, NoopHooks, SwitchHookContext, SwitchHooks};
 use crate::paths::Paths;
 use crate::profile::{
-    Profile, ProfileRegistry, RESERVED_PREVIOUS_NAME, account_key, identity_summary,
-    validate_profile_name,
+    account_key, identity_summary, validate_profile_name, Profile, ProfileRegistry,
+    RESERVED_PREVIOUS_NAME,
 };
 use crate::secret::Secret;
-use crate::vault::{ProfileVault, SystemProfileVault, system_profile_vault};
-use anyhow::{Context, Result, anyhow};
+use crate::vault::{system_profile_vault, ProfileVault, SystemProfileVault};
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-pub struct Ccswap<A, V> {
+pub struct Ccswap<A, V, H = NoopHooks> {
     active: A,
     vault: V,
+    hooks: H,
     claude: ClaudeFile,
     profiles: ProfileRegistry,
     previous: PreviousStore,
@@ -57,7 +59,11 @@ impl PreviousStore {
     }
 
     pub fn save(&self, oauth_account: &Value) -> Result<()> {
-        if let Some(parent) = self.path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fsutil::ensure_private_dir(parent)?;
         }
         fsutil::write_json_atomic(&self.path, oauth_account, Some(0o600))
@@ -67,30 +73,27 @@ impl PreviousStore {
     pub fn load(&self) -> Result<Value> {
         let bytes = std::fs::read(&self.path)
             .with_context(|| format!("read previous account {}", self.path.display()))?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", self.path.display()))
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", self.path.display()))
     }
 }
 
-impl Ccswap<SystemActiveStore, SystemProfileVault> {
+impl Ccswap<SystemActiveStore, SystemProfileVault, ConfiguredHooks> {
     pub fn discover() -> Result<Self> {
         let paths = Paths::discover()?;
         let active = system_active_store(&paths)?;
         let vault = system_profile_vault(&paths)?;
-        Ok(Self::from_parts(paths, active, vault))
+        let hooks = ConfiguredHooks::new(paths.hooks_path.clone());
+        Ok(Self::from_parts_with_hooks(paths, active, vault, hooks))
     }
 }
 
-impl<A, V> Ccswap<A, V>
+impl<A, V> Ccswap<A, V, NoopHooks>
 where
     A: ActiveStore,
     V: ProfileVault,
 {
     pub fn from_parts(paths: Paths, active: A, vault: V) -> Self {
-        let claude = ClaudeFile::new(paths.claude_json_path);
-        let profiles = ProfileRegistry::new(paths.profiles_dir);
-        let previous = PreviousStore::new(paths.previous_path);
-        Self::new(active, vault, claude, profiles, previous)
+        Self::from_parts_with_hooks(paths, active, vault, NoopHooks)
     }
 
     pub fn new(
@@ -100,9 +103,35 @@ where
         profiles: ProfileRegistry,
         previous: PreviousStore,
     ) -> Self {
+        Self::new_with_hooks(active, vault, claude, profiles, previous, NoopHooks)
+    }
+}
+
+impl<A, V, H> Ccswap<A, V, H>
+where
+    A: ActiveStore,
+    V: ProfileVault,
+    H: SwitchHooks,
+{
+    pub fn from_parts_with_hooks(paths: Paths, active: A, vault: V, hooks: H) -> Self {
+        let claude = ClaudeFile::new(paths.claude_json_path);
+        let profiles = ProfileRegistry::new(paths.profiles_dir);
+        let previous = PreviousStore::new(paths.previous_path);
+        Self::new_with_hooks(active, vault, claude, profiles, previous, hooks)
+    }
+
+    pub fn new_with_hooks(
+        active: A,
+        vault: V,
+        claude: ClaudeFile,
+        profiles: ProfileRegistry,
+        previous: PreviousStore,
+        hooks: H,
+    ) -> Self {
         Self {
             active,
             vault,
+            hooks,
             claude,
             profiles,
             previous,
@@ -177,6 +206,17 @@ where
             .claude
             .read_oauth_account()
             .context("snapshot current oauthAccount")?;
+        let previous_profile = self.profile_name_for_account(&previous_account)?;
+        let hook_context = SwitchHookContext::new(
+            name.clone(),
+            target_account.clone(),
+            previous_profile,
+            previous_account.clone(),
+        );
+        self.hooks
+            .run(HookPhase::PreUse, &hook_context)
+            .context("pre-use hook failed")?;
+
         let previous_secret = self.active.read().context("snapshot current credential")?;
 
         self.previous.save(&previous_account)?;
@@ -185,11 +225,30 @@ where
             .context("snapshot current credential to previous slot")?;
 
         if let Err(err) = self.claude.write_oauth_account(&target_account) {
-            return self.switch_error_with_rollback(err, &previous_account, &previous_secret);
+            return self.switch_error_with_rollback(
+                err,
+                &previous_account,
+                &previous_secret,
+                &hook_context,
+            );
         }
 
         if let Err(err) = self.active.write(target_secret) {
-            return self.switch_error_with_rollback(err, &previous_account, &previous_secret);
+            return self.switch_error_with_rollback(
+                err,
+                &previous_account,
+                &previous_secret,
+                &hook_context,
+            );
+        }
+
+        if let Err(err) = self.hooks.run(HookPhase::PostUse, &hook_context) {
+            return self.switch_error_with_rollback(
+                err.context("post-use hook failed"),
+                &previous_account,
+                &previous_secret,
+                &hook_context,
+            );
         }
 
         Ok(UseResult {
@@ -247,13 +306,26 @@ where
         err: anyhow::Error,
         previous_account: &Value,
         previous_secret: &Secret,
+        hook_context: &SwitchHookContext,
     ) -> Result<UseResult> {
         match self.rollback(previous_account, previous_secret) {
-            Ok(()) => Err(err.context("switch failed; rolled back to previous account")),
+            Ok(()) => match self.run_post_use_rollback_hook(hook_context) {
+                Ok(()) => Err(err.context("switch failed; rolled back to previous account")),
+                Err(hook_err) => Err(anyhow!(
+                    "switch failed: {err:#}; rolled back to previous account; rollback post-use hook failed: {hook_err:#}"
+                )),
+            },
             Err(rollback_err) => Err(anyhow!(
                 "switch failed: {err:#}; rollback failed: {rollback_err:#}"
             )),
         }
+    }
+
+    fn run_post_use_rollback_hook(&self, hook_context: &SwitchHookContext) -> Result<()> {
+        let Some(rollback_context) = hook_context.previous_as_rollback_target() else {
+            return Ok(());
+        };
+        self.hooks.run(HookPhase::PostUse, &rollback_context)
     }
 
     fn rollback(&self, previous_account: &Value, previous_secret: &Secret) -> Result<()> {
@@ -263,6 +335,13 @@ where
         self.active
             .write(previous_secret)
             .context("rollback credential")
+    }
+
+    fn profile_name_for_account(&self, oauth_account: &Value) -> Result<Option<String>> {
+        Ok(self
+            .profiles
+            .find_by_account(oauth_account)?
+            .map(|profile| profile.name))
     }
 }
 
@@ -274,12 +353,14 @@ pub fn format_identity(oauth_account: &Value) -> String {
 mod tests {
     use super::*;
     use crate::active::ActiveStore;
+    use crate::hooks::{HookPhase, SwitchHookContext, SwitchHooks};
     use crate::profile::ProfileRegistry;
     use crate::vault::{FileVault, ProfileVault};
-    use anyhow::{Result, bail};
+    use anyhow::{bail, Result};
     use serde_json::json;
     use std::cell::{Cell, RefCell};
     use std::fs;
+    use std::rc::Rc;
     use tempfile::tempdir;
 
     #[derive(Debug)]
@@ -311,6 +392,40 @@ mod tests {
                 bail!("active write failed")
             }
             *self.secret.borrow_mut() = secret.clone();
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct RecordingHooks {
+        calls: Rc<RefCell<Vec<(HookPhase, String)>>>,
+        failures: Rc<RefCell<Vec<(HookPhase, String)>>>,
+    }
+
+    impl RecordingHooks {
+        fn fail_for(&self, phase: HookPhase, target_profile: &str) {
+            self.failures
+                .borrow_mut()
+                .push((phase, target_profile.to_string()));
+        }
+
+        fn calls(&self) -> Vec<(HookPhase, String)> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl SwitchHooks for RecordingHooks {
+        fn run(&self, phase: HookPhase, context: &SwitchHookContext) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .push((phase, context.target_profile.clone()));
+            if self
+                .failures
+                .borrow()
+                .contains(&(phase, context.target_profile.clone()))
+            {
+                bail!("hook failed for {}", context.target_profile);
+            }
             Ok(())
         }
     }
@@ -354,6 +469,39 @@ mod tests {
         (app, dir, claude_path)
     }
 
+    fn test_app_with_hooks(
+        hooks: RecordingHooks,
+    ) -> (
+        Ccswap<MemoryActiveStore, FileVault, RecordingHooks>,
+        tempfile::TempDir,
+        PathBuf,
+    ) {
+        let dir = tempdir().unwrap();
+        let claude_path = dir.path().join(".claude.json");
+        fs::write(
+            &claude_path,
+            serde_json::to_vec(&json!({
+                "oauthAccount": account("old", "org"),
+                "projects": { "keep": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let active = MemoryActiveStore::new(Secret::new(b"old-token".to_vec()));
+        let vault = FileVault::new(dir.path().join("vault"));
+        let app = Ccswap::new_with_hooks(
+            active,
+            vault,
+            ClaudeFile::new(&claude_path),
+            ProfileRegistry::new(dir.path().join("profiles")),
+            PreviousStore::new(dir.path().join("state").join("previous.json")),
+            hooks,
+        );
+
+        (app, dir, claude_path)
+    }
+
     #[cfg(unix)]
     #[test]
     fn previous_store_creates_state_dir_private_0700() {
@@ -392,16 +540,12 @@ mod tests {
         let entries = app.list_profiles().unwrap();
 
         assert_eq!(entries.len(), 2);
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name == "work" && entry.current)
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name == "other" && !entry.current)
-        );
+        assert!(entries
+            .iter()
+            .any(|entry| entry.name == "work" && entry.current));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.name == "other" && !entry.current));
     }
 
     #[test]
@@ -452,6 +596,59 @@ mod tests {
         let root: Value = serde_json::from_slice(&fs::read(claude_path).unwrap()).unwrap();
         assert_eq!(root["oauthAccount"]["accountUuid"], "old");
         assert_eq!(root["projects"]["keep"], true);
+    }
+
+    #[test]
+    fn pre_use_hook_failure_does_not_switch_account() {
+        let hooks = RecordingHooks::default();
+        hooks.fail_for(HookPhase::PreUse, "target");
+        let (app, _dir, claude_path) = test_app_with_hooks(hooks.clone());
+        app.profiles
+            .save("target", &account("new", "org2"))
+            .unwrap();
+        app.vault
+            .store("target", &Secret::new(b"new-token".to_vec()))
+            .unwrap();
+
+        let err = app.use_profile("target").unwrap_err();
+
+        assert!(format!("{err:#}").contains("pre-use hook failed"));
+        assert_eq!(
+            hooks.calls(),
+            vec![(HookPhase::PreUse, "target".to_string())]
+        );
+        assert_eq!(app.active.read().unwrap().expose(), b"old-token");
+        let root: Value = serde_json::from_slice(&fs::read(claude_path).unwrap()).unwrap();
+        assert_eq!(root["oauthAccount"]["accountUuid"], "old");
+    }
+
+    #[test]
+    fn post_use_hook_failure_rolls_back_and_runs_previous_post_hook() {
+        let hooks = RecordingHooks::default();
+        hooks.fail_for(HookPhase::PostUse, "target");
+        let (app, _dir, claude_path) = test_app_with_hooks(hooks.clone());
+        app.save_profile("work").unwrap();
+        app.profiles
+            .save("target", &account("new", "org2"))
+            .unwrap();
+        app.vault
+            .store("target", &Secret::new(b"new-token".to_vec()))
+            .unwrap();
+
+        let err = app.use_profile("target").unwrap_err();
+
+        assert!(format!("{err:#}").contains("rolled back"));
+        assert_eq!(
+            hooks.calls(),
+            vec![
+                (HookPhase::PreUse, "target".to_string()),
+                (HookPhase::PostUse, "target".to_string()),
+                (HookPhase::PostUse, "work".to_string()),
+            ]
+        );
+        assert_eq!(app.active.read().unwrap().expose(), b"old-token");
+        let root: Value = serde_json::from_slice(&fs::read(claude_path).unwrap()).unwrap();
+        assert_eq!(root["oauthAccount"]["accountUuid"], "old");
     }
 
     #[test]
