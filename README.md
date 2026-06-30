@@ -222,6 +222,24 @@ cargo build --release
 
 Ignored tests touch the real OS keychain or secret store.
 
+### Signed dev builds (macOS, optional)
+
+An adhoc-signed binary's Keychain trust is pinned to its cdhash, which changes on
+every `cargo build`, so the Keychain "Always Allow" grant never sticks and you are
+re-prompted after each rebuild. Sign dev builds with a stable self-signed identity
+to make one grant persist.
+
+One-time: create the identity in **Keychain Access → Certificate Assistant →
+Create a Certificate**, named exactly `ccswap-dev`, Identity Type "Self Signed
+Root", Certificate Type "Code Signing".
+
+`.cargo/config.toml` then routes `cargo run`/`cargo test` through
+`scripts/sign-and-run.sh`, which signs each binary with `ccswap-dev` (identifier
+`dev.ccswap.cli`) before running it. Without the identity the binary runs unsigned,
+so contributors and CI are unaffected. Run cargo from the repo root. This is a dev
+convenience only; the `Claude Code-credentials` item is owned by Claude Code, so its
+first access still prompts once.
+
 See [docs/DESIGN.md](docs/DESIGN.md) and [docs/adr](docs/adr) for the design
 notes and architectural decisions.
 
